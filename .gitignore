@@ -1,3 +1,19 @@
 *.db
+*.db-shm
+*.db-wal
 claude_desktop_config.json
 whatsapp.log
+
+# El store del bridge: bases de datos Y TODOS LOS MEDIOS de los chats reales
+# (notas de voz, imágenes, vídeos, PDFs de reservas). `*.db` no bastaba: los
+# medios no son .db y quedaban sin ignorar. Este repo tiene un remoto PÚBLICO.
+whatsapp-bridge/store/
+
+# Datos personales: mapea LID -> teléfono real.
+whatsapp-mcp-server/aliases.json
+
+# Binarios compilados (23 MB cada uno) y copias de seguridad locales.
+whatsapp-bridge/whatsapp-bridge
+*.bak
+*.bak-*
+*.bak.*
