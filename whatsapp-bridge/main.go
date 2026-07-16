@@ -938,12 +938,50 @@ func main() {
 	client.Disconnect()
 }
 
+// contactNames agrupa los campos de nombre que WhatsApp guarda de un contacto.
+// Un contacto bajo @lid suele traer FullName vacío y el nombre real en PushName.
+type contactNames struct {
+	FullName     string
+	FirstName    string
+	PushName     string
+	BusinessName string
+}
+
+// pickContactName elige el mejor nombre disponible de un contacto.
+// Orden: la libreta (FullName) manda sobre el nombre comercial, y ambos sobre
+// el que el contacto se pone a sí mismo (PushName). Los contactos @lid llegan
+// con FullName vacío, así que PushName es a menudo el único nombre que hay.
+// Devuelve "" si el contacto no aporta ningún nombre utilizable.
+func pickContactName(c contactNames) string {
+	for _, candidate := range []string{c.FullName, c.BusinessName, c.PushName, c.FirstName} {
+		if name := strings.TrimSpace(candidate); name != "" {
+			return name
+		}
+	}
+	return ""
+}
+
+// isPlaceholderName indica si el nombre guardado no es un nombre real sino el
+// propio identificador del chat (un teléfono o un LID), y por tanto debe
+// volver a resolverse en lugar de reutilizarse.
+func isPlaceholderName(name string, jidUser string) bool {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return true
+	}
+	if name == strings.TrimSpace(jidUser) || name == "Group "+jidUser {
+		return true
+	}
+	// Un "nombre" compuesto sólo de dígitos es un identificador, no un nombre.
+	return strings.IndexFunc(name, func(r rune) bool { return r < '0' || r > '9' }) == -1
+}
+
 // GetChatName determines the appropriate name for a chat based on JID and other info
 func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types.JID, chatJID string, conversation interface{}, sender string, logger waLog.Logger) string {
 	// First, check if chat already exists in database with a name
 	var existingName string
 	err := messageStore.db.QueryRow("SELECT name FROM chats WHERE jid = ?", chatJID).Scan(&existingName)
-	if err == nil && existingName != "" {
+	if err == nil && !isPlaceholderName(existingName, jid.User) {
 		// Chat exists with a name, use that
 		logger.Infof("Using existing chat name for %s: %s", chatJID, existingName)
 		return existingName
@@ -1005,9 +1043,38 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 		// Just use contact info (full name)
 		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
-		if err == nil && contact.FullName != "" {
-			name = contact.FullName
-		} else if sender != "" {
+		if err == nil {
+			name = pickContactName(contactNames{
+				FullName:     contact.FullName,
+				FirstName:    contact.FirstName,
+				PushName:     contact.PushName,
+				BusinessName: contact.BusinessName,
+			})
+		}
+
+		// Un chat @lid puede no tener ningún nombre en su propia ficha, mientras
+		// que la ficha del teléfono correspondiente sí lo tiene. Resolvemos el
+		// LID a teléfono y miramos ese contacto antes de rendirnos al número.
+		if name == "" && jid.Server == types.HiddenUserServer {
+			pn, lidErr := client.Store.LIDs.GetPNForLID(context.Background(), jid)
+			if lidErr == nil && !pn.IsEmpty() {
+				if pnContact, pnErr := client.Store.Contacts.GetContact(context.Background(), pn); pnErr == nil {
+					name = pickContactName(contactNames{
+						FullName:     pnContact.FullName,
+						FirstName:    pnContact.FirstName,
+						PushName:     pnContact.PushName,
+						BusinessName: pnContact.BusinessName,
+					})
+					if name != "" {
+						logger.Infof("Resolved %s to %s via LID map: %s", chatJID, pn.User, name)
+					}
+				}
+			}
+		}
+
+		if name != "" {
+			// nombre resuelto
+		} else if sender != "" && !isPlaceholderName(sender, jid.User) {
 			// Fallback to sender
 			name = sender
 		} else {
