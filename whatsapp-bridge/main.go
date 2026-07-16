@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -24,11 +25,21 @@ import (
 
 	"go.mau.fi/whatsmeow"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
+	"go.mau.fi/whatsmeow/proto/waMmsRetry"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
 	"google.golang.org/protobuf/proto"
+)
+
+// Registro de descargas esperando una respuesta de media-retry.
+// Cuando la descarga normal falla (403/404/410 en media que llegó por
+// history-sync), pedimos al teléfono del remitente que re-suba el media
+// (SendMediaRetryReceipt) y esperamos aquí el *events.MediaRetry de respuesta.
+var (
+	mediaRetryMu      sync.Mutex
+	mediaRetryWaiters = make(map[types.MessageID]chan *events.MediaRetry)
 )
 
 // Message represents a chat message for our client
@@ -569,6 +580,72 @@ func (d *MediaDownloader) GetMediaType() whatsmeow.MediaType {
 	return d.MediaType
 }
 
+// requestMediaRetry pide al teléfono del remitente que re-suba el media de un
+// mensaje y devuelve la notificación con el DirectPath fresco. Es el último
+// recurso cuando el CDN rechaza la descarga (403/404/410), típico en media que
+// llegó por history-sync tras una reconexión. Solo funciona si el dispositivo
+// del remitente sigue online y conserva el media.
+func requestMediaRetry(client *whatsmeow.Client, messageStore *MessageStore, messageID, chatJID string, mediaKey []byte) (*waMmsRetry.MediaRetryNotification, error) {
+	chat, err := types.ParseJID(chatJID)
+	if err != nil {
+		return nil, fmt.Errorf("chat jid inválido: %v", err)
+	}
+
+	var isFromMe bool
+	var senderStr string
+	_ = messageStore.db.QueryRow(
+		"SELECT is_from_me, sender FROM messages WHERE id = ? AND chat_jid = ?",
+		messageID, chatJID,
+	).Scan(&isFromMe, &senderStr)
+
+	info := &types.MessageInfo{
+		ID: types.MessageID(messageID),
+		MessageSource: types.MessageSource{
+			Chat:     chat,
+			IsFromMe: isFromMe,
+			IsGroup:  chat.Server == types.GroupServer,
+		},
+	}
+	// En grupos el receipt necesita el participante; en chats directos no.
+	if info.IsGroup && senderStr != "" {
+		if s, err := types.ParseJID(senderStr); err == nil {
+			info.Sender = s
+		} else if !strings.Contains(senderStr, "@") {
+			info.Sender = types.NewJID(senderStr, types.DefaultUserServer)
+		}
+	}
+
+	// Registrar el canal ANTES de enviar el receipt para no perder la respuesta.
+	ch := make(chan *events.MediaRetry, 1)
+	mediaRetryMu.Lock()
+	mediaRetryWaiters[types.MessageID(messageID)] = ch
+	mediaRetryMu.Unlock()
+	defer func() {
+		mediaRetryMu.Lock()
+		delete(mediaRetryWaiters, types.MessageID(messageID))
+		mediaRetryMu.Unlock()
+	}()
+
+	ctx := context.Background()
+	if err := client.SendMediaRetryReceipt(ctx, info, mediaKey); err != nil {
+		return nil, fmt.Errorf("enviar retry receipt: %v", err)
+	}
+
+	select {
+	case evt := <-ch:
+		retryData, err := whatsmeow.DecryptMediaRetryNotification(evt, mediaKey)
+		if err != nil {
+			return nil, fmt.Errorf("descifrar notificación: %v", err)
+		}
+		if retryData.GetResult() != waMmsRetry.MediaRetryNotification_SUCCESS {
+			return nil, fmt.Errorf("el teléfono no re-subió el media (resultado: %v)", retryData.GetResult())
+		}
+		return retryData, nil
+	case <-time.After(30 * time.Second):
+		return nil, fmt.Errorf("timeout esperando respuesta de media-retry")
+	}
+}
+
 // Function to download media from a message
 func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, messageID, chatJID string) (bool, string, string, string, error) {
 	// Query the database for the message
@@ -659,7 +736,29 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	// Download the media using whatsmeow client
 	mediaData, err := client.Download(context.Background(), downloader)
 	if err != nil {
-		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
+		// Fallback: WhatsApp's CDN can reject the directPath/mediaConn route
+		// with 403 for unofficial linked devices. Retry forcing the raw URL
+		// route (the access token is embedded in the stored URL itself).
+		fmt.Printf("download via directPath failed (%v), retrying via raw URL...\n", err)
+		downloader.DirectPath = ""
+		mediaData, err = client.Download(context.Background(), downloader)
+	}
+	if err != nil {
+		// Último recurso: pedir al teléfono del remitente que re-suba el media
+		// y reintentar con el DirectPath fresco.
+		fmt.Printf("descarga fallida (%v); intentando media-retry receipt...\n", err)
+		if retryData, rErr := requestMediaRetry(client, messageStore, messageID, chatJID, mediaKey); rErr != nil {
+			fmt.Printf("media-retry FALLIDO para %s: %v\n", messageID, rErr)
+			return false, "", "", "", fmt.Errorf("failed to download media: %v (media-retry: %v)", err, rErr)
+		} else {
+			downloader.URL = ""
+			downloader.DirectPath = retryData.GetDirectPath()
+			mediaData, err = client.Download(context.Background(), downloader)
+			if err != nil {
+				return false, "", "", "", fmt.Errorf("failed to download media after retry: %v", err)
+			}
+			fmt.Printf("media-retry OK para %s\n", messageID)
+		}
 	}
 
 	// Save the downloaded media to file
@@ -866,6 +965,28 @@ func main() {
 
 		case *events.LoggedOut:
 			logger.Warnf("Device logged out, please scan QR code to log in again")
+
+		case *events.StreamReplaced:
+			// WhatsApp reemplazó el stream (rotación de Meta u otra sesión web).
+			// whatsmeow trata esto como desconexión PERMANENTE y no reintenta:
+			// el watchdog de abajo se encarga de reconectar.
+			logger.Warnf("Stream replaced; el watchdog reconectará")
+
+		case *events.KeepAliveTimeout:
+			logger.Warnf("Keepalive timeout; el watchdog vigilará la reconexión")
+
+		case *events.MediaRetry:
+			// Respuesta del teléfono a un SendMediaRetryReceipt: entregarla a
+			// la descarga que la está esperando (si aún hay alguna).
+			mediaRetryMu.Lock()
+			ch, ok := mediaRetryWaiters[v.MessageID]
+			mediaRetryMu.Unlock()
+			if ok {
+				select {
+				case ch <- v:
+				default:
+				}
+			}
 		}
 	})
 
@@ -920,6 +1041,39 @@ func main() {
 	}
 
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
+
+	// Watchdog de reconexión: whatsmeow NO reconecta tras desconexiones
+	// permanentes (StreamReplaced, keepalive timeout duro). Este loop detecta
+	// "logueado pero desconectado" y fuerza Connect() con backoff exponencial,
+	// que es lo que evita que el bridge se quede "Not connected" para siempre.
+	go func() {
+		const baseDelay = 15 * time.Second
+		const maxDelay = 5 * time.Minute
+		delay := baseDelay
+		for {
+			time.Sleep(delay)
+			// Sin sesión guardada (esperando QR): nada que reconectar.
+			if client.Store.ID == nil {
+				delay = baseDelay
+				continue
+			}
+			if client.IsConnected() {
+				delay = baseDelay
+				continue
+			}
+			logger.Warnf("Watchdog: desconectado, reconectando...")
+			if err := client.Connect(); err != nil {
+				logger.Errorf("Watchdog: fallo al reconectar: %v", err)
+				delay *= 2
+				if delay > maxDelay {
+					delay = maxDelay
+				}
+			} else {
+				logger.Infof("Watchdog: reconexión lanzada")
+				delay = baseDelay
+			}
+		}
+	}()
 
 	// Start REST API server
 	startRESTServer(client, messageStore, 8080)
