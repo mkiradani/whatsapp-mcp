@@ -8,11 +8,16 @@ import json
 import audio
 
 MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
+WHATSAPP_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'whatsapp.db')
 WHATSAPP_API_BASE_URL = "http://localhost:8080/api"
 ALIASES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'aliases.json')
 
-# LID alias resolution — maps WhatsApp @lid JIDs to @s.whatsapp.net phone numbers
+# LID alias resolution — maps WhatsApp @lid JIDs to @s.whatsapp.net phone numbers.
+# La fuente de verdad es whatsmeow_lid_map (whatsapp.db), que el bridge mantiene al
+# día con cientos de entradas; aliases.json queda como override manual encima, para
+# forzar mapeos que whatsmeow no conoce.
 _aliases_cache: Optional[Dict] = None
+_lid_map_cache: Optional[Dict[str, str]] = None
 
 def _load_aliases() -> Dict:
     global _aliases_cache
@@ -25,15 +30,36 @@ def _load_aliases() -> Dict:
         _aliases_cache = {"lid_to_phone": {}}
     return _aliases_cache
 
+def _load_lid_map() -> Dict[str, str]:
+    """Build the lid -> phone map: whatsmeow_lid_map first, aliases.json on top."""
+    global _lid_map_cache
+    if _lid_map_cache is not None:
+        return _lid_map_cache
+
+    mapping: Dict[str, str] = {}
+    try:
+        conn = sqlite3.connect(f"file:{WHATSAPP_DB_PATH}?mode=ro", uri=True)
+        try:
+            for lid, pn in conn.execute("SELECT lid, pn FROM whatsmeow_lid_map"):
+                if lid and pn:
+                    mapping[str(lid)] = str(pn)
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        # Sin whatsapp.db (o sin esa tabla) nos quedamos con el override manual.
+        pass
+
+    mapping.update(_load_aliases().get("lid_to_phone", {}))
+    _lid_map_cache = mapping
+    return _lid_map_cache
+
 def _lid_to_phone(lid_id: str) -> Optional[str]:
     """Resolve a LID sender ID to a phone number."""
-    aliases = _load_aliases()
-    return aliases.get("lid_to_phone", {}).get(lid_id)
+    return _load_lid_map().get(lid_id)
 
 def _phone_to_lids(phone: str) -> List[str]:
     """Find all LID IDs mapped to a phone number."""
-    aliases = _load_aliases()
-    return [lid for lid, ph in aliases.get("lid_to_phone", {}).items() if ph == phone]
+    return [lid for lid, ph in _load_lid_map().items() if ph == phone]
 
 def _resolve_all_chat_jids(jid: str) -> List[str]:
     """Given any JID, return all JIDs (including aliases) for that contact."""
